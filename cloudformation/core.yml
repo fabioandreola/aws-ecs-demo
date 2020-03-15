@@ -2,6 +2,67 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: This stack deploys the core network infrastructure and IAM resources
              to be used for a service hosted in Amazon ECS using AWS Fargate.
+Parameters:
+  StackName:
+    Type: String
+    Default: "SpringRedisChatStack"
+    Description: The name of the parent Fargate networking stack that you created. Necessary
+                 to locate and reference resources created by that stack.
+  ServiceName:
+    Type: String
+    Default: SpringRedisChat
+    Description: A name for the service
+  ImageUrl:
+    Type: String
+    Default: fabioandreola/spring-redis-websocket
+    Description: The url of a docker image that contains the application process that
+                 will handle the traffic for this service
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: What port number the application inside the docker container is binding to
+  ContainerCpu:
+    Type: Number
+    Default: 512
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 1024
+    Description: How much memory in megabytes to give the container
+  Path:
+    Type: String
+    Default: "*"
+    Description: A path on the public load balancer that this service
+                 should be connected to. Use * to send all load balancer
+                 traffic to this service.
+  HealthCheckPath:
+    Type: String
+    Default: /
+    Description: The health check resource
+
+  LoadBalancerPort:
+    Type: Number
+    Default: 80
+    Description: The port for the public load balancer
+
+  Priority:
+    Type: Number
+    Default: 1
+    Description: The priority for the routing rule added to the load balancer.
+                 This only applies if your have multiple services which have been
+                 assigned to different paths on the load balancer.
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: How many copies of the service task to run
+  Role:
+    Type: String
+    Default: "RedisChatFullAccessRole"
+    Description: (Optional) An IAM role to give the service's containers if the code within needs to
+                 access other AWS resources like S3 buckets, DynamoDB tables, etc
+
+Conditions:
+  HasCustomRole: !Not [ !Equals [!Ref 'Role', ''] ]
 
 Mappings:
   # Hard values for the subnet masks. These masks define
@@ -276,16 +337,6 @@ Resources:
                 - 'logs:PutLogEvents'
               Resource: '*'
 
-            - Effect: Allow
-              Action:
-                # Allows the ECS tasks to interact with only the MysfitsTable
-                # in DynamoDB
-                - 'dynamodb:Scan'
-                - 'dynamodb:Query'
-                - 'dynamodb:UpdateItem'
-                - 'dynamodb:GetItem'
-              Resource: 'arn:aws:dynamodb:*:*:table/MysfitsTable*'
-
   # An IAM role that allows the AWS CodePipeline service to perform it's
   # necessary actions. We have intentionally left permissions on this role
   # that will not be used by the CodePipeline service during this workshop.
@@ -295,7 +346,7 @@ Resources:
   SpringRedisWebsocketServiceCodePipelineServiceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: SpringRedisWebsocketServiceCodePipelineServiceRole
+      RoleName: !Join ['', [!Ref ServiceName, ECSServiceRole]]
       AssumeRolePolicyDocument:
         Statement:
         - Effect: Allow
@@ -306,7 +357,7 @@ Resources:
           - sts:AssumeRole
       Path: "/"
       Policies:
-      - PolicyName: SpringRedisWebsocketService-codepipeline-service-policy
+      - PolicyName: !Join ['', [!Ref ServiceName, CodePipelineServicePolicy]]
         PolicyDocument:
           Statement:
           - Action:
@@ -345,7 +396,7 @@ Resources:
   SpringRedisWebsocketServiceCodeBuildServiceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: SpringRedisWebsocketServiceCodeBuildServiceRole
+      RoleName: !Join ['', [!Ref ServiceName, ServiceCodeBuildServiceRole]]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -354,7 +405,7 @@ Resources:
             Service: codebuild.amazonaws.com
           Action: sts:AssumeRole
       Policies:
-      - PolicyName: "SpringRedisWebsocketService-CodeBuildServicePolicy"
+      - PolicyName: !Join ['', [!Ref ServiceName, CodeBuildServicePolicy]]
         PolicyDocument:
           Version: "2012-10-17"
           Statement:
@@ -386,28 +437,30 @@ Resources:
             - "ecr:GetAuthorizationToken"
             Resource: "*"
 
+  # Redis setup
   RedisSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Access to the Redis Chat
       VpcId: !Ref 'VPC'
       SecurityGroupIngress:
-          # Allow access to ALB from anywhere on the internet
           - CidrIp: !FindInMap ['SubnetConfig', 'PrivateOne', 'CIDR']
             IpProtocol: -1
+          - CidrIp: !FindInMap ['SubnetConfig', 'PrivateTwo', 'CIDR']
+            IpProtocol: -1
 
-  SubnetGroup:
+  ElastiCacheSubnetGroup:
     Type: AWS::ElastiCache::SubnetGroup
     Properties:
       Description: Cache Subnet Group
       SubnetIds:
-        - !Ref PublicSubnetOne
-        - !Ref PublicSubnetTwo
-
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+  
   RedisChat:
     Type: AWS::ElastiCache::CacheCluster
     Properties: 
-      CacheSubnetGroupName: !Ref SubnetGroup
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
       AutoMinorVersionUpgrade: true
       CacheNodeType: "cache.t2.micro"
       ClusterName: "RedisChatCluster"
@@ -418,6 +471,144 @@ Resources:
       VpcSecurityGroupIds: 
         - !GetAtt 'RedisSecurityGroup.GroupId'
 
+  # Load balancer setup
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      # will look for a 200 status code by default unless specified otherwise
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Join ['', [!Ref ServiceName, TargetGroup]]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !Ref VPC
+
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTP
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['', [!Ref ServiceName, LoadBalancerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        # this is the default, but is specified here in case it needs to be changed
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+      Name: !Join ['', [!Ref ServiceName, LoadBalancer]]
+      # "internal" is also an option
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+
+  # ECS setup
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['', [!Ref ServiceName, ContainerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: dev
+  
+  SpringRedisWebsocketTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - RedisChat
+    Properties:
+      Family: !Ref 'ServiceName'
+      Cpu: !Ref 'ContainerCpu'
+      Memory: !Ref 'ContainerMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskRole
+      TaskRoleArn: !Ref EcsServiceRole
+      ContainerDefinitions:
+        - Name: !Ref 'ServiceName'
+          Cpu: !Ref 'ContainerCpu'
+          Memory: !Ref 'ContainerMemory'
+          Image: !Ref 'ImageUrl'
+          Environment: 
+            - Name: SPRING_REDIS_HOST
+              Value: !GetAtt 'RedisChat.RedisEndpoint.Address'
+          PortMappings:
+            - ContainerPort: !Ref 'ContainerPort'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref SpringRedisWebsocketLogGroup
+              awslogs-stream-prefix: SpringRedisService
+
+  SpringRedisChatService:
+    Type: AWS::ECS::Service
+    # This dependency is needed so that the load balancer is setup correctly in time
+    DependsOn:
+      - ListenerHTTP
+    Properties: 
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref SpringRedisWebsocketTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 2
+      # This may need to be adjusted if the container takes a while to start up
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          # change to DISABLED if you're using private subnets that have access to a NAT gateway
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PrivateSubnetOne
+            - !Ref PrivateSubnetTwo
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+  SpringRedisWebsocketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Join ['', [!Ref ServiceName, LogGroup]]
+      RetentionInDays: 1
 
 # These are the values output by the CloudFormation template. Be careful
 # about changing any of them, because of them are exported with specific
