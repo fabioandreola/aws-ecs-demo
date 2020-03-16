@@ -1,7 +1,7 @@
 ---
 AWSTemplateFormatVersion: '2010-09-09'
 Description: This stack deploys the core network infrastructure and IAM resources
-             to be used for a service hosted in Amazon ECS using AWS Fargate.
+             to be used for the Spring Redis Websocket demo service hosted in Amazon ECS using AWS Fargate.
 Parameters:
   StackName:
     Type: String
